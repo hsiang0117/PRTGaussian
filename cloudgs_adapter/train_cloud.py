@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import random
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -26,7 +27,57 @@ from .cloud_data import CloudDataset
 def write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+
+
+def atomic_checkpoint(value, path):
+    """One rotating checkpoint, with space for atomic replacement and 1 GiB spare."""
+    path = Path(path)
+    seen = set()
+    def tensor_bytes(item):
+        if isinstance(item, torch.Tensor):
+            identity = (str(item.device), item.untyped_storage().data_ptr())
+            if identity in seen:
+                return 0
+            seen.add(identity)
+            return item.untyped_storage().nbytes()
+        if isinstance(item, dict):
+            return sum(tensor_bytes(x) for x in item.values())
+        if isinstance(item, (list, tuple)):
+            return sum(tensor_bytes(x) for x in item)
+        return 0
+    required = tensor_bytes(value) + 1024**3
+    if shutil.disk_usage(path.parent).free < required:
+        raise OSError(f"Insufficient checkpoint disk space: need {required} free bytes")
+    temporary = path.with_name(path.name + ".partial")
+    torch.save(value, temporary)
+    temporary.replace(path)
+
+
+def capture_rng():
+    return {"python": random.getstate(), "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(), "torch_cuda": torch.cuda.get_rng_state_all()}
+
+
+def restore_rng(value):
+    random.setstate(value["python"])
+    np.random.set_state(value["numpy"])
+    torch.set_rng_state(value["torch_cpu"].cpu())
+    torch.cuda.set_rng_state_all([item.cpu() for item in value["torch_cuda"]])
+
+
+def restore_adam_step_device(state):
+    # map_location='cuda' must not move uncapturable Adam's scalar step counters
+    # from their original CPU placement; keep its original numerical code path.
+    for group in state["param_groups"]:
+        if not group.get("capturable", False) and not group.get("fused", False):
+            for identifier in group["params"]:
+                values = state["state"].get(identifier, {})
+                if isinstance(values.get("step"), torch.Tensor):
+                    values["step"] = values["step"].cpu()
+    return state
 
 
 def save_image(path, image):
@@ -118,6 +169,7 @@ def train(args):
         with log_path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(value) + "\n")
         print(json.dumps(value), flush=True)
+        write_json(output / "progress.json", {**value, "updated": datetime.now().isoformat()})
 
     def render_frame(frame, decoder=None, coefficients=None):
         camera = dataset.camera(frame, device="cuda")
@@ -143,6 +195,8 @@ def train(args):
                 raise ValueError(f"Coarse checkpoint data mismatch: {key}")
         if xyz.ndim != 2 or xyz.shape[1] != 3 or not len(xyz) or not torch.isfinite(xyz).all():
             raise ValueError("Invalid coarse point cloud")
+        if state["steps"] != args.stage1_iterations:
+            raise ValueError("Coarse checkpoint does not match the requested Stage-1 budget")
         summary["stage1_reused"] = str(Path(args.stage1_checkpoint).absolute())
     else:
         opt = options(args.stage1_iterations)
@@ -211,6 +265,7 @@ def train(args):
         summary["stages"]["stage1"] = {"steps": args.stage1_iterations, "training_seconds": seconds,
             "probe_l1_before": s1_before, "probe_l1_after": after, "first_grad": first_grad,
             "gaussians": len(xyz), "peak_allocated_bytes": torch.cuda.max_memory_allocated()}
+        write_json(output / "stage1_summary.json", summary["stages"]["stage1"])
         del package, loss, l1, image, target, camera
     # Released Scene(load_pts=...) only transfers XYZ, resets all other properties.
     del model
@@ -229,6 +284,35 @@ def train(args):
     coeffs = {sun: dataset.light_coefficients(frame, get_sh_coeffs, order=9).cuda()
               for sun, frame in train_suns.items()}
     probe = dataset.train[0]
+    resumed = None
+    if args.resume_stage2:
+        del model, decoder, decoder_opt
+        gc.collect()
+        torch.cuda.empty_cache()
+        resumed = torch.load(args.resume_stage2, map_location="cuda", weights_only=False)
+        for key in ("root", "point_cloud_path", "scene_similarity", "train_files", "test_files"):
+            if resumed["data_manifest"][key] != manifest[key]:
+                raise ValueError(f"Resume data mismatch: {key}")
+        if (resumed["network_config"] != config or resumed["args"]["batch_size"] != args.batch_size
+                or resumed["args"]["resolution"] != args.resolution):
+            raise ValueError("Resume network, resolution or batch size differs")
+        if resumed["args"]["stage2_iterations"] != args.stage2_iterations:
+            raise ValueError("Resume must preserve the original Stage-2 budget")
+        if not 0 < resumed["step"] < args.stage2_iterations:
+            raise ValueError("Resume checkpoint must precede the final iteration")
+        if resumed["source_sha256"] != source_hashes:
+            raise ValueError("Resume source files changed")
+        restore_adam_step_device(resumed["gaussians"][11])
+        restore_adam_step_device(resumed["decoder_optimizer"])
+        model = GaussianModel(3)
+        model.restore(resumed["gaussians"], options(args.stage2_iterations))
+        decoder = tcnn.NetworkWithInputEncoding(n_input_dims=3, n_output_dims=243,
+                      encoding_config=config["encoding"], network_config=config["network"]).cuda()
+        decoder.load_state_dict(resumed["decoder"])
+        decoder_opt = torch.optim.Adam(decoder.parameters(), lr=1e-3)
+        decoder_opt.load_state_dict(resumed["decoder_optimizer"])
+        summary["stages"] = resumed["summary"]["stages"]
+        summary["resumed_from"] = str(Path(args.resume_stage2).absolute())
     initial = sample_snapshot(model)
     network_initial = next(decoder.parameters()).detach().flatten()[:4096].clone()
     with torch.no_grad():
@@ -236,13 +320,26 @@ def train(args):
         s2_before = float((image - target).abs().mean())
         save_image(output / "rendertest/stage2_000000.png", image)
         save_image(output / "rendertest/stage2_target.png", target)
-    stack = []
-    first_grad = None
+    stack, first_grad, first_step, elapsed_before = [], None, 0, 0.0
+    if resumed is not None:
+        frames_by_id = {frame.uid: frame for frame in dataset.train}
+        stack = [frames_by_id[uid] for uid in resumed["sampler_stack"]]
+        first_grad, first_step = resumed["first_grad"], resumed["step"]
+        elapsed_before, s2_before = resumed["training_seconds"], resumed["s2_before"]
+        restore_rng(resumed["rng"])
+        del resumed
+    def save_stage2_checkpoint(step, seconds, destination):
+        atomic_checkpoint({"gaussians": model.capture(), "decoder": decoder.state_dict(),
+            "decoder_optimizer": decoder_opt.state_dict(), "step": step,
+            "network_config": config, "data_manifest": manifest, "args": vars(args),
+            "source_sha256": source_hashes, "summary": summary, "s2_before": s2_before,
+            "first_grad": first_grad, "training_seconds": seconds,
+            "sampler_stack": [frame.uid for frame in stack], "rng": capture_rng()}, destination)
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
     start = time.perf_counter()
     excluded = 0.0
-    for step in range(1, args.stage2_iterations + 1):
+    for step in range(first_step + 1, args.stage2_iterations + 1):
         loss_value = 0.0
         for _ in range(args.batch_size):
             if not stack:
@@ -274,8 +371,15 @@ def train(args):
                 save_image(output / f"rendertest/stage2_{step:06d}.png", image)
             torch.cuda.synchronize()
             excluded += time.perf_counter() - pause
+        if args.checkpoint_every and step % args.checkpoint_every == 0 and step < args.stage2_iterations:
+            torch.cuda.synchronize()
+            pause = time.perf_counter()
+            elapsed = elapsed_before + pause - start - excluded
+            save_stage2_checkpoint(step, elapsed, output / "checkpoint_latest.pt")
+            torch.cuda.synchronize()
+            excluded += time.perf_counter() - pause
     torch.cuda.synchronize()
-    seconds = time.perf_counter() - start - excluded
+    seconds = elapsed_before + time.perf_counter() - start - excluded
     with torch.no_grad():
         image, target = render_frame(probe, decoder, coeffs[probe.sun_index])
         after = float((image - target).abs().mean())
@@ -286,9 +390,8 @@ def train(args):
         "network_mean_abs_change_first_4096": float((next(decoder.parameters()).detach().flatten()[:4096] - network_initial).abs().mean()),
         "peak_allocated_bytes": torch.cuda.max_memory_allocated()}
     model.save_ply(str(output / "point_cloud/iteration_final/point_cloud.ply"))
-    torch.save({"gaussians": model.capture(), "decoder": decoder.state_dict(),
-        "decoder_optimizer": decoder_opt.state_dict(), "step": args.stage2_iterations,
-        "network_config": config, "data_manifest": manifest, "args": vars(args)}, output / "checkpoint.pt")
+    save_stage2_checkpoint(args.stage2_iterations, seconds, output / "checkpoint.pt")
+    (output / "checkpoint_latest.pt").unlink(missing_ok=True)
     # Verify real serialization/restoration, not merely successful file creation.
     with torch.no_grad():
         reference, _ = render_frame(probe, decoder, coeffs[probe.sun_index])
@@ -328,6 +431,8 @@ def train(args):
             save_image(output / f"test_preview/{frame.key}.png", image)
             save_image(output / f"test_preview/{frame.key}_gt.png", target)
     summary["status"] = "complete"
+    write_json(output / "progress.json", {"stage": "complete", "status": "complete",
+               "steps": [args.stage1_iterations, args.stage2_iterations], "updated": datetime.now().isoformat()})
     final_hashes = {str(p): hashlib.file_digest(p.open("rb"), "sha256").hexdigest() for p in source_paths}
     if final_hashes != source_hashes:
         raise AssertionError("Source PLY or fixed split changed")
@@ -345,6 +450,8 @@ def main():
     parser.add_argument("--stage1-iterations", type=int, default=30000)
     parser.add_argument("--stage2-iterations", type=int, default=30000)
     parser.add_argument("--stage1-checkpoint")
+    parser.add_argument("--resume-stage2")
+    parser.add_argument("--checkpoint-every", type=int, default=7000)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--network-config", default="config/config.json")
     parser.add_argument("--point-limit", type=int, default=0)
@@ -358,6 +465,10 @@ def main():
         parser.error("Iterations, batch size and intervals must be positive")
     if not args.diagnostic and args.point_limit:
         parser.error("--point-limit requires --diagnostic")
+    if args.checkpoint_every < 0:
+        parser.error("--checkpoint-every must be nonnegative")
+    if args.resume_stage2 and not args.stage1_checkpoint:
+        parser.error("--resume-stage2 also requires the originating --stage1-checkpoint coarse_xyz.pt")
     train(args)
 
 

@@ -92,3 +92,45 @@ agreement, fixed-camera multi-sun response, CUDA synchronized loop time excludin
 preview/export, and peak allocated memory. The output includes cfg_args, PLY,
 checkpoint, rendertest PNG/NPZ and a few final test previews. No formal full-test
 evaluation is performed by this validation entry.
+
+## Formal 01/02 env-off queue
+
+```bash
+python -u -m cloudgs_adapter.run_formal_queue \
+  --control /myfiles/projects/PRTGaussian/.experiment-control/20261015_formal_envoff --run
+python -m cloudgs_adapter.run_formal_queue \
+  --control /myfiles/projects/PRTGaussian/.experiment-control/20261015_formal_envoff --poll
+```
+
+The caller detaches the queue using a new process session. The queue runs 01 then
+02, each with 30k standard-3DGS mean-image iterations and 30k native SH-transport
+iterations at 1024, batch 8, the original full network, and previews every 1000
+steps in both stages. Thirty thousand is the released training parser's effective
+default; the unused `Scene.iterations=300000` INI key is not an active budget.
+Do not describe these counts as an independently verified paper-specified budget.
+
+Each case gets its actual launch timestamp and dataset identifier in `output`.
+The queue holds a lock inherited by the training child, refuses an occupied GPU
+or less than 10 GiB free disk before a case, records child PIDs and logs, validates
+successful budgets/source hashes, and stops on failure without blind retries.
+
+Stage 2 writes a rotating resumable `checkpoint_latest.pt` every 7000 iterations,
+using atomic replacement and a free-space guard. It saves both optimizers, the
+remaining shuffled training stack and Python/NumPy/Torch random states. Saving
+does not change losses, sampling or iteration budgets; checkpoint/preview I/O is
+excluded from training-loop timing. After the final checkpoint is safely saved,
+the rotating checkpoint is removed. Stage-1 XYZ/PLY and timing are saved when
+that stage completes. To resume Stage 2 into a new output directory:
+
+```bash
+python -m cloudgs_adapter.train_cloud --source /myfiles/data/CloudDatasetUniform \
+  --output output/NEW_TIMESTAMP_prt_cloud01_envoff_resume \
+  --stage1-checkpoint output/ORIGINAL_RUN/coarse_xyz.pt \
+  --resume-stage2 output/ORIGINAL_RUN/checkpoint_latest.pt \
+  --stage1-iterations 30000 --stage2-iterations 30000 \
+  --resolution 1024 --batch-size 8 --preview-every 1000 --checkpoint-every 7000
+```
+
+Review the queue state before resuming; an existing unfinished queue is not
+automatically overwritten. Formal evaluation and dataset/model downloads are
+separate from this training launch.
