@@ -1,0 +1,12 @@
+# CUDA 12.8 / CPython 3.12. Local wheels may be supplied through --find-links.
+# Install torch first; build CUDA extensions with --no-build-isolation.
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+numpy==2.2.6
+Pillow==11.3.0
+plyfile==1.1.2
+commentjson==0.9.0
+setuptools==80.9.0
+wheel==0.45.1
+ninja==1.13.0
+tqdm==4.67.1

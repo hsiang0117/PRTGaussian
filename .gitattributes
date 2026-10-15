@@ -1,0 +1,2 @@
+# Patch context intentionally contains source whitespace.
+cloudgs_adapter/upstream_patches/*.patch -whitespace

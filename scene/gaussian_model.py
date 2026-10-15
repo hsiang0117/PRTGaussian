@@ -77,7 +77,7 @@ class GaussianModel:
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
-            self.albedo,
+            self._albedo,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )

@@ -13,11 +13,8 @@ import os
 import random
 import json
 from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
-from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
-from utils.light_utils import light_to_JSON
 from utils.sh_utils import SH2RGB
 import sys
 from plyfile import PlyData
@@ -48,6 +45,11 @@ class Scene:
         :param path: Path to colmap scene main folder.
         """
         
+        # Keep headless GaussianModel imports independent of dataset/EXR tooling.
+        from scene.dataset_readers import sceneLoadTypeCallbacks
+        from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+        from utils.light_utils import light_to_JSON
+
         self.loaded_iter = None
         self.gaussians = gaussians
         self.model_path = model_path

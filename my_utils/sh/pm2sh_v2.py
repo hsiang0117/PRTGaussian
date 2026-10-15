@@ -4,15 +4,7 @@ SH implementation reference: https://github.com/abdallahdib/NextFace/blob/main/s
 
 
 import math
-from PIL import Image
 import torch
-from torchvision import transforms
-from torchvision.utils import save_image
-import numpy as np
-import pyshtools as pysh 
-import sys
-import imageio
-import OpenEXR
 
 
 def associated_legendre_polynomial(l, m, x):
@@ -51,7 +43,7 @@ def SH(l, m, theta, phi):
 def get_sh_coeffs(direction=[0.,0.], order=3):
     '''
     input: direction [b,3]
-    output: 
+    output:
         coeffs: with size of [b,3,order**2]
     '''
     phi, theta = direction
@@ -63,10 +55,10 @@ def get_sh_coeffs(direction=[0.,0.], order=3):
         for m in range(-l, l + 1):
             sh_basis.append(SH(l, m, theta, phi))
     sh_basis = torch.stack(sh_basis, dim=-1)  # [h,w,n]
-    
+
     # 将系数扩展为所需的形状 [3, n]
     coeffs = sh_basis.unsqueeze(0).repeat(3, 1)
-    
+
     # 将coeffs转化为float类型
     coeffs = coeffs.float()
     return coeffs
@@ -74,11 +66,11 @@ def get_sh_coeffs(direction=[0.,0.], order=3):
 def get_pm_from_sh(coeffs, resolution=[32, 16], order=3):
     '''
     input: coeffs [b,3,order**2]
-    output: 
+    output:
         pm: [b,3,h,w] the env map represented by SH basis
     '''
     w, h = resolution
-    
+
     theta = torch.linspace(0, math.pi, h)  # [h] from 0 to pi
     phi = torch.linspace(0, 2 * math.pi, w)  # [w] from 0 to 2pi
     theta = theta[..., None].repeat(1, w)  # [h,w]
@@ -96,6 +88,11 @@ def get_pm_from_sh(coeffs, resolution=[32, 16], order=3):
     return pm
 
 if __name__ == "__main__":
+    # Optional image/export dependencies are needed only by this demonstration.
+    import numpy as np
+    import imageio
+    from torchvision.utils import save_image
+
     direction = [0., np.pi/4]
     order = 5
     coffes = get_sh_coeffs(direction, order=order)

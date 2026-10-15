@@ -1,0 +1,9 @@
+{
+  "upstream_commit": "f29bbf1a03416aecf879782906b3be377f84a4f8",
+  "tinycudann_commit": "3daa6e5b8b8e0fa17971a1a20acfbb3754494b38",
+  "torch_local_wheels": "/myfiles/projects/Vol3DGS/dependency-cache/wheels",
+  "knn_missing_header": "cfloat",
+  "raster_missing_header": "cstdint",
+  "torch_headers_modified": false,
+  "cuda_algorithms_modified": false
+}

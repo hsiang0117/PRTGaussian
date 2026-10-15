@@ -1,0 +1,70 @@
+diff --git a/scene/__init__.py b/scene/__init__.py
+--- a/scene/__init__.py
++++ b/scene/__init__.py
+@@ -13,11 +13,8 @@
+ import random
+ import json
+ from utils.system_utils import searchForMaxIteration
+-from scene.dataset_readers import sceneLoadTypeCallbacks
+ from scene.gaussian_model import GaussianModel
+ from arguments import ModelParams
+-from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+-from utils.light_utils import light_to_JSON
+ from utils.sh_utils import SH2RGB
+ import sys
+ from plyfile import PlyData
+@@ -48,6 +45,11 @@
+         :param path: Path to colmap scene main folder.
+         """
+         
++        # Keep headless GaussianModel imports independent of dataset/EXR tooling.
++        from scene.dataset_readers import sceneLoadTypeCallbacks
++        from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
++        from utils.light_utils import light_to_JSON
++
+         self.loaded_iter = None
+         self.gaussians = gaussians
+         self.model_path = model_path
+diff --git a/my_utils/sh/pm2sh_v2.py b/my_utils/sh/pm2sh_v2.py
+--- a/my_utils/sh/pm2sh_v2.py
++++ b/my_utils/sh/pm2sh_v2.py
+@@ -4,15 +4,7 @@
+ 
+ 
+ import math
+-from PIL import Image
+ import torch
+-from torchvision import transforms
+-from torchvision.utils import save_image
+-import numpy as np
+-import pyshtools as pysh 
+-import sys
+-import imageio
+-import OpenEXR
+ 
+ 
+ def associated_legendre_polynomial(l, m, x):
+@@ -96,6 +88,11 @@
+     return pm
+ 
+ if __name__ == "__main__":
++    # Optional image/export dependencies are needed only by this demonstration.
++    import numpy as np
++    import imageio
++    from torchvision.utils import save_image
++
+     direction = [0., np.pi/4]
+     order = 5
+     coffes = get_sh_coeffs(direction, order=order)
+diff --git a/scene/gaussian_model.py b/scene/gaussian_model.py
+--- a/scene/gaussian_model.py
++++ b/scene/gaussian_model.py
+@@ -77,7 +77,7 @@
+             self.max_radii2D,
+             self.xyz_gradient_accum,
+             self.denom,
+-            self.albedo,
++            self._albedo,
+             self.optimizer.state_dict(),
+             self.spatial_lr_scale,
+         )

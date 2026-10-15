@@ -8,3 +8,11 @@ diff_rasterization/diff_rast.egg-info
 diff_rasterization/dist
 tensorboard_3d
 screenshots
+.venv/
+external-dependencies/
+dependency-cache/
+setup-logs/
+*_bundle.zip
+*.egg-info/
+*.whl
+__pycache__/
