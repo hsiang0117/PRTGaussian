@@ -160,25 +160,69 @@ def require_free_disk(repo):
     return free
 
 
-def build_plan(repo):
-    return {
+def build_plan(repo, resume_control=None):
+    plan = {
         "repo": str(repo), "stage1_iterations": 30000,
         "stage2_iterations": 30000, "resolution": 1024, "batch_size": 8,
         "preview_every": 1000, "checkpoint_every": 7000,
         "network_config": "config/config.json",
         "cases": [{"dataset": identifier, "source": source} for identifier, source in SOURCES],
     }
+    if resume_control is None:
+        return plan
+    resume_control = Path(resume_control).absolute()
+    previous_plan = read_json(resume_control / "plan.json")
+    previous = read_json(resume_control / "state.json")
+    for key in ("repo", "stage1_iterations", "stage2_iterations", "resolution", "batch_size",
+                "preview_every", "checkpoint_every", "network_config"):
+        if previous_plan.get(key) != plan[key]:
+            raise RuntimeError(f"Originating queue has a different {key}; refusing to change protocol")
+    if [(case.get("dataset"), case.get("source")) for case in previous_plan.get("cases", [])] != list(SOURCES):
+        raise RuntimeError("Originating queue has different datasets or ordering")
+    if pid_alive(previous.get("pid")) or any(pid_alive(case.get("pid")) for case in previous.get("cases", [])):
+        raise RuntimeError("Originating queue or training child is still alive; stop it before resuming")
+    previous_cases = previous.get("cases", [])
+    if [(case.get("dataset"), case.get("source")) for case in previous_cases] != list(SOURCES):
+        raise RuntimeError("Originating queue state has different datasets or ordering")
+    plan["resume_control"] = str(resume_control)
+    for case, origin in zip(plan["cases"], previous_cases):
+        if not origin.get("output"):
+            if origin.get("status") != "pending":
+                raise RuntimeError(f"Dataset {case['dataset']} has no resumable output")
+            continue
+        output = Path(origin["output"]).absolute()
+        try:
+            output.resolve().relative_to((repo / "output").resolve())
+        except ValueError as error:
+            raise RuntimeError("Originating output is outside this project's output directory") from error
+        summary_path = output / "validation_summary.json"
+        if summary_path.is_file() and read_json(summary_path).get("status") == "complete":
+            validate_success(output)
+            case["reuse_output"] = str(output)
+        else:
+            coarse, checkpoint = output / "coarse_xyz.pt", output / "checkpoint_latest.pt"
+            for path in (coarse, checkpoint):
+                if not path.is_file() or path.stat().st_size == 0:
+                    raise RuntimeError(f"Dataset {case['dataset']} has no complete resume file: {path}")
+            case.update(stage1_checkpoint=str(coarse), resume_stage2=str(checkpoint),
+                        resume_output=str(output))
+        case["origin_status"] = origin.get("status")
+    return plan
 
 
 def build_command(repo, case, output):
     # Never resolve() this symlink: doing so switches to the system Python.
     python = repo / ".venv" / "bin" / "python"
-    return [str(python), "-u", "-m", "cloudgs_adapter.train_cloud",
+    command = [str(python), "-u", "-m", "cloudgs_adapter.train_cloud",
             "--source", case["source"], "--output", str(output),
             "--stage1-iterations", "30000", "--stage2-iterations", "30000",
             "--resolution", "1024", "--batch-size", "8",
             "--preview-every", "1000", "--checkpoint-every", "7000",
             "--network-config", "config/config.json"]
+    if case.get("resume_stage2"):
+        command.extend(["--stage1-checkpoint", case["stage1_checkpoint"],
+                        "--resume-stage2", case["resume_stage2"]])
+    return command
 
 
 def validate_success(output):
@@ -208,10 +252,12 @@ def new_output(repo, identifier):
     raise RuntimeError("Could not allocate a fresh timestamp output directory")
 
 
-def run(control, repo):
-    plan = build_plan(repo)
+def run(control, repo, resume_control=None):
+    if resume_control is not None and Path(resume_control).resolve() == control.resolve():
+        raise RuntimeError("A resumed queue requires a new control directory; origin state is preserved")
     control.mkdir(parents=True, exist_ok=True)
     with project_lock(repo) as lock_fd:
+        plan = build_plan(repo, resume_control)
         plan_path, state_path = control / "plan.json", control / "state.json"
         if plan_path.exists():
             if read_json(plan_path) != plan:
@@ -242,6 +288,14 @@ def run(control, repo):
         try:
             for case in state["cases"]:
                 active = case
+                if case.get("reuse_output"):
+                    summary = validate_success(case["reuse_output"])
+                    case.update(status="complete", output=case["reuse_output"],
+                                reused_completed=True, stages=summary["stages"], finished=now(),
+                                checkpoint_restore_max_abs_error=summary.get("checkpoint_restore_max_abs_error"))
+                    state["updated"] = now()
+                    atomic_json(state_path, state)
+                    continue
                 require_idle_gpu()
                 case["free_bytes_before"] = require_free_disk(repo)
                 output = new_output(repo, case["dataset"])
@@ -285,15 +339,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--control", required=True, type=Path)
     parser.add_argument("--repo", type=Path, default=Path(__file__).absolute().parent.parent)
+    parser.add_argument("--resume-control", type=Path,
+                        help="Stopped originating queue; keep completed cases and resume Stage 2 checkpoints")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--run", action="store_true")
     mode.add_argument("--poll", action="store_true")
     args = parser.parse_args()
     if not args.control.is_absolute():
         parser.error("--control must be absolute")
+    if args.resume_control is not None and (not args.run or not args.resume_control.is_absolute()):
+        parser.error("--resume-control requires --run and an absolute originating control path")
     repo = args.repo.absolute()
     try:
-        result = poll(args.control) if args.poll else run(args.control, repo)
+        result = poll(args.control) if args.poll else run(args.control, repo, args.resume_control)
     except Exception as error:
         print(json.dumps({"status": "error", "error": str(error)}, ensure_ascii=False), file=sys.stderr)
         return 1

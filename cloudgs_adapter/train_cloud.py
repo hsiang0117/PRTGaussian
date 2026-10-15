@@ -22,6 +22,7 @@ import torch
 from PIL import Image
 
 from .cloud_data import CloudDataset
+from .stage2_execution import stage2_backward
 
 
 def write_json(path, value):
@@ -181,6 +182,11 @@ def train(args):
         image = render(camera, model, pipe, background, override_color=color)["render"]
         return image, camera.original_image
 
+    def render_color(frame, color):
+        camera = dataset.camera(frame, device="cuda")
+        image = render(camera, model, pipe, background, override_color=color)["render"]
+        return image, camera.original_image
+
     probe_stage1 = dataset.stage1[0]
     with torch.no_grad():
         image, target = render_frame(probe_stage1)
@@ -199,6 +205,7 @@ def train(args):
             raise ValueError("Coarse checkpoint does not match the requested Stage-1 budget")
         summary["stage1_reused"] = str(Path(args.stage1_checkpoint).absolute())
     else:
+        summary["stage1_target_cache"] = dataset.prepare_target_cache("stage1")
         opt = options(args.stage1_iterations)
         model.training_setup(opt)
         # Stage 1 is standard 3DGS, as described in the paper. The released
@@ -267,6 +274,7 @@ def train(args):
             "gaussians": len(xyz), "peak_allocated_bytes": torch.cuda.max_memory_allocated()}
         write_json(output / "stage1_summary.json", summary["stages"]["stage1"])
         del package, loss, l1, image, target, camera
+    dataset.clear_target_cache()
     # Released Scene(load_pts=...) only transfers XYZ, resets all other properties.
     del model
     gc.collect()
@@ -313,12 +321,40 @@ def train(args):
         decoder_opt.load_state_dict(resumed["decoder_optimizer"])
         summary["stages"] = resumed["summary"]["stages"]
         summary["resumed_from"] = str(Path(args.resume_stage2).absolute())
+        # Keep the resumed output self-contained without altering the source run.
+        origin = Path(args.stage1_checkpoint).parent
+        for name in ("coarse_xyz.pt", "stage1_summary.json", "stage1/point_cloud.ply"):
+            source = origin / name
+            if source.is_file():
+                destination = output / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+        if (origin / "traininglog.jsonl").is_file():
+            retained = []
+            for line in (origin / "traininglog.jsonl").read_text(encoding="utf-8").splitlines():
+                row = json.loads(line)
+                if row.get("stage") == 1 or (row.get("stage") == 2 and row.get("step", 0) <= resumed["step"]):
+                    retained.append(line)
+            log_path.write_text("\n".join(retained) + "\n", encoding="utf-8")
+        for source in (origin / "rendertest").glob("*"):
+            stem = source.stem
+            keep = stem.startswith("stage1_") or stem == "stage2_target"
+            if stem.startswith("stage2_") and stem[7:].isdigit():
+                keep = int(stem[7:]) <= resumed["step"]
+            if keep and source.is_file():
+                destination = output / "rendertest" / source.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+        summary["resume_step"] = resumed["step"]
+    summary["stage2_target_cache"] = dataset.prepare_target_cache("stage2")
+    summary["stage2_execution"] = "shared_per_frame"
     initial = sample_snapshot(model)
     network_initial = next(decoder.parameters()).detach().flatten()[:4096].clone()
     with torch.no_grad():
         image, target = render_frame(probe, decoder, coeffs[probe.sun_index])
         s2_before = float((image - target).abs().mean())
-        save_image(output / "rendertest/stage2_000000.png", image)
+        preview_step = resumed["step"] if resumed is not None else 0
+        save_image(output / f"rendertest/stage2_{preview_step:06d}.png", image)
         save_image(output / "rendertest/stage2_target.png", target)
     stack, first_grad, first_step, elapsed_before = [], None, 0, 0.0
     if resumed is not None:
@@ -340,19 +376,15 @@ def train(args):
     start = time.perf_counter()
     excluded = 0.0
     for step in range(first_step + 1, args.stage2_iterations + 1):
-        loss_value = 0.0
+        frames = []
         for _ in range(args.batch_size):
             if not stack:
                 stack = list(dataset.train)
                 random.shuffle(stack)
             frame = stack.pop()
-            image, target = render_frame(frame, decoder, coeffs[frame.sun_index])
-            # Match released training: only (1-lambda_dssim)*L1, no DSSIM term.
-            loss = 0.8 * (image - target).abs().mean() / args.batch_size
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f"Stage2 loss at {step}")
-            loss.backward()
-            loss_value += float(loss.detach())
+            frames.append(frame)
+        loss_value = stage2_backward(frames, model, decoder, coeffs, render_color,
+                                     mode="shared_per_frame")
         if step == 1:
             first_grad = {"network": check_gradients(decoder.parameters()),
                           "geometry": check_gradients([model._xyz, model._scaling, model._rotation, model._opacity])}
@@ -361,8 +393,12 @@ def train(args):
         model.optimizer.zero_grad(set_to_none=True)
         decoder_opt.zero_grad(set_to_none=True)
         # No densification or LR scheduling in the released Stage-2 train loop.
-        if step == 1 or step % args.log_every == 0:
-            log({"stage": 2, "step": step, "loss": loss_value, "gaussians": len(model.get_xyz)})
+        if step == first_step + 1 or step % args.log_every == 0:
+            row = {"stage": 2, "step": step, "loss": loss_value, "gaussians": len(model.get_xyz)}
+            if step == first_step + 1:
+                row["frame_uids"] = [frame.uid for frame in frames]
+                row["execution"] = "shared_per_frame"
+            log(row)
         if step % args.preview_every == 0 or step == args.stage2_iterations:
             torch.cuda.synchronize()
             pause = time.perf_counter()
@@ -386,6 +422,7 @@ def train(args):
     summary["stages"]["stage2"] = {"steps": args.stage2_iterations, "batch_size": args.batch_size,
         "training_seconds": seconds, "probe_l1_before": s2_before, "probe_l1_after": after,
         "gaussians": len(model.get_xyz), "first_grad": first_grad,
+        "parameter_change_start_step": first_step,
         "parameter_changes": changes(model, initial),
         "network_mean_abs_change_first_4096": float((next(decoder.parameters()).detach().flatten()[:4096] - network_initial).abs().mean()),
         "peak_allocated_bytes": torch.cuda.max_memory_allocated()}
@@ -396,7 +433,7 @@ def train(args):
     with torch.no_grad():
         reference, _ = render_frame(probe, decoder, coeffs[probe.sun_index])
         reference = reference.cpu()
-    del model, decoder, decoder_opt, loss, image, target, initial, network_initial
+    del model, decoder, decoder_opt, image, target, initial, network_initial
     gc.collect()
     torch.cuda.empty_cache()
     loaded = torch.load(output / "checkpoint.pt", map_location="cuda", weights_only=False)

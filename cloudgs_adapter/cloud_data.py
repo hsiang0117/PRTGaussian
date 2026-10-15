@@ -19,6 +19,7 @@ import json
 import math
 from pathlib import Path
 import re
+import time
 from types import SimpleNamespace
 from typing import NamedTuple
 
@@ -198,7 +199,7 @@ def camera_matrices(frame, znear=0.01, zfar=100.0):
 
 
 class CloudDataset:
-    """Metadata plus at most cache_images resized RGB uint8 images on CPU."""
+    """Metadata, a bounded uint8 LRU, and an optional training-stage target cache."""
 
     def __init__(self, root, resolution=0, cache_images=16, *, point_cloud_path=None,
                  normalize_scene=False, normalization_margin=0.05):
@@ -207,6 +208,8 @@ class CloudDataset:
             raise ValueError('resolution and cache_images must be nonnegative integers')
         self.resolution, self.cache_images = int(resolution), int(cache_images)
         self._images = OrderedDict()
+        self._target_cache = {}
+        self._target_cache_stage = None
         self._derived_mean_paths = {}
         self.train = self._read_split('train', 0)
         self.test = self._read_split('test', len(self.train))
@@ -357,6 +360,68 @@ class CloudDataset:
         """Float32 HWC pixel-space target, without exposure/max normalization."""
         return self.image_uint8(frame).astype(np.float32) / 255.
 
+    @staticmethod
+    def _target_key(frame):
+        return ('mean', frame.camera_index) if isinstance(frame, MeanFrame) else ('png', frame.image_path)
+
+    def target_cpu(self, frame):
+        """Return the original float32 CHW target, optionally reused from CPU RAM.
+
+        Consumers must treat targets as read-only. No CUDA tensor is retained by
+        the dataset, and uncached frames (including test frames) are never added
+        implicitly. The conversion expression is exactly the previous camera
+        loader, so caching changes no alpha, resize, mean, or rounding operation.
+        """
+        import torch
+        key = self._target_key(frame)
+        if key in self._target_cache:
+            return self._target_cache[key]
+        return torch.from_numpy(self.image(frame).transpose(2, 0, 1).copy())
+
+    def prepare_target_cache(self, stage, *, max_bytes=24 * 1024**3):
+        """Predecode one training stage outside the loop, without drawing RNG.
+
+        The byte budget is checked from authoritative resized image dimensions
+        before any allocation. A stage switch releases the previous targets
+        before constructing the next cache. Failure clears partial targets, so
+        a retry cannot silently retain a second full cache. Test images cannot
+        be requested through this interface. Source images remain read-only.
+        """
+        if stage not in ('stage1', 'stage2'):
+            raise ValueError("target cache stage must be 'stage1' or 'stage2'")
+        if isinstance(max_bytes, bool) or int(max_bytes) != max_bytes or max_bytes < 0:
+            raise ValueError('max_bytes must be a nonnegative integer')
+        frames = self.stage1 if stage == 'stage1' else self.train
+        expected_bytes = sum(frame.width * frame.height * 3 * 4 for frame in frames)
+        if expected_bytes > max_bytes:
+            raise MemoryError(f'{stage} targets require {expected_bytes} bytes; cache budget is {max_bytes}')
+        started = time.perf_counter()
+        self.clear_target_cache()
+        self.clear_cache()
+        try:
+            for frame in frames:
+                self._target_cache[self._target_key(frame)] = self.target_cpu(frame)
+            self._target_cache_stage = stage
+        except BaseException:
+            self.clear_target_cache()
+            raise
+        finally:
+            # The float32 cache fully replaces training-target uint8 reuse.
+            self.clear_cache()
+        return dict(stage=stage, frames=len(frames), bytes=self.target_cache_bytes,
+                    budget_bytes=int(max_bytes), preparation_seconds=time.perf_counter() - started,
+                    dtype='float32', layout='CHW', device='cpu', source='training_only',
+                    conversion='existing uint8 target -> float32 / 255 -> CHW contiguous')
+
+    @property
+    def target_cache_bytes(self):
+        return sum(value.numel() * value.element_size() for value in self._target_cache.values())
+
+    def clear_target_cache(self):
+        """Release the current stage targets; held camera references remain valid."""
+        self._target_cache.clear()
+        self._target_cache_stage = None
+
     def prepare_stage1_means(self, directory):
         """Compute once outside training; keep derived files out of source data."""
         directory = Path(directory).resolve()
@@ -410,7 +475,7 @@ class CloudDataset:
         for key in ('world_view_transform', 'projection_matrix', 'full_proj_transform', 'camera_center'):
             setattr(camera, key, torch.tensor(values[key], dtype=torch.float32, device=device))
         if include_image:
-            camera.original_image = torch.from_numpy(self.image(frame).transpose(2, 0, 1).copy()).to(device)
+            camera.original_image = self.target_cpu(frame).to(device)
         return camera
 
     def read_point_cloud(self, normalized=True):

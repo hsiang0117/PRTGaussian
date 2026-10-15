@@ -134,3 +134,38 @@ python -m cloudgs_adapter.train_cloud --source /myfiles/data/CloudDatasetUniform
 Review the queue state before resuming; an existing unfinished queue is not
 automatically overwritten. Formal evaluation and dataset/model downloads are
 separate from this training launch.
+
+## Execution optimizations with unchanged training protocol
+
+The adapter predecodes the current stage's training targets to a read-only CPU
+float32 CHW cache, using exactly the existing alpha/resize/rounding conversion.
+Stage-1 and Stage-2 caches replace each other; test targets are not preloaded.
+The default 24 GiB cache budget accommodates 1308 RGB targets at 1024 (15.33 GiB).
+Check the container's actual memory limit before training. Cache preparation is
+outside training-loop timing and does not draw from any training RNG.
+
+Stage 2 shares one transport-network forward across the eight images in a batch.
+It retains a single network graph and frees each rasterization graph immediately.
+It deliberately keeps eight network backward calls, preserving the original
+per-image conversion of the output gradient to tiny-cuda-nn's internal FP16.
+Simply summing FP32 color derivatives before one network backward changes those
+rounding operations; the `shared_sum` helper is only a diagnostic candidate.
+Loss/finite checks use one host scalar per batch and occur before optimizer
+updates. XYZ remains detached at the decoder input. Model dimensions, losses,
+precision, light SH, image order, budgets and optimizer steps are unchanged.
+
+After stopping and verifying both the previous queue and child have exited,
+continue the two-case queue into a fresh control directory:
+
+```bash
+python -u -m cloudgs_adapter.run_formal_queue --run \
+  --control /myfiles/projects/PRTGaussian/.experiment-control/NEW_OPTIMIZED_QUEUE \
+  --resume-control /myfiles/projects/PRTGaussian/.experiment-control/ORIGINAL_QUEUE
+```
+
+The original queue/output remains intact. A partial Stage-2 case resumes both
+optimizers, RNGs and the remaining image stack from its atomic checkpoint; pending
+cases use the optimized code from their first step. The resumed output copies
+Stage-1 artifacts and only the retained pre-checkpoint logs/previews, and records
+its origin and resume step. Validate actual CUDA loss, gradients and an Adam
+update at the real checkpoint before switching an active experiment.

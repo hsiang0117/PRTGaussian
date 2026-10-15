@@ -5,9 +5,11 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import random
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 from PIL import Image
@@ -133,6 +135,58 @@ class DataTests(unittest.TestCase):
         (self.root/'transforms_test.json').write_text(json.dumps(meta))
         with self.assertRaisesRegex(ValueError, 'overlap'):
             data.CloudDataset(self.root)
+
+    def test_target_cache_bit_exact_rgba_resize_camera_and_training_means(self):
+        import torch
+        rgba = np.arange(4 * 8 * 4, dtype=np.uint8).reshape(4, 8, 4) * np.uint8(2)
+        rgba[..., 3] = np.arange(32, dtype=np.uint8).reshape(4, 8) * np.uint8(8)
+        Image.fromarray(rgba, mode='RGBA').save(self.ds.train[0].image_path)
+        ds = data.CloudDataset(self.root, resolution=4, cache_images=0)
+        expected = {f.file_path: torch.from_numpy(ds.image(f).transpose(2, 0, 1).copy()) for f in ds.train}
+        source_before = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in self.root.rglob('*') if p.is_file()}
+        stats = ds.prepare_target_cache('stage2')
+        self.assertEqual(stats['bytes'], 3 * 2 * 4 * 3 * 4)
+        self.assertEqual((stats['frames'], stats['dtype'], stats['layout'], stats['device']), (3, 'float32', 'CHW', 'cpu'))
+        with mock.patch.object(data.Image, 'open', side_effect=AssertionError('cached targets must not read PNG')):
+            for frame in ds.train:
+                target = ds.target_cpu(frame)
+                self.assertTrue(torch.equal(target, expected[frame.file_path]))
+                self.assertTrue(target.is_contiguous())
+                self.assertFalse(target.requires_grad)
+                self.assertEqual(ds.camera(frame, device='cpu').original_image.data_ptr(), target.data_ptr())
+        self.assertEqual(source_before, {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in self.root.rglob('*') if p.is_file()})
+        means = [torch.from_numpy(ds.image(f).transpose(2, 0, 1).copy()) for f in ds.stage1]
+        ds.prepare_target_cache('stage1')
+        self.assertEqual(ds.target_cache_bytes, 2 * 2 * 4 * 3 * 4)
+        for frame, expected_mean in zip(ds.stage1, means):
+            self.assertTrue(torch.equal(ds.target_cpu(frame), expected_mean))
+
+    def test_target_cache_budget_stage_switch_test_exclusion_and_rng(self):
+        import torch
+        python_before, numpy_before, torch_before = random.getstate(), np.random.get_state(), torch.get_rng_state().clone()
+        first = self.ds.prepare_target_cache('stage1', max_bytes=2 * 4 * 8 * 3 * 4)
+        self.assertEqual(first['bytes'], 2 * 4 * 8 * 3 * 4)
+        with self.assertRaises(MemoryError):
+            self.ds.prepare_target_cache('stage2', max_bytes=first['bytes'])
+        self.assertEqual(self.ds._target_cache_stage, 'stage1')
+        self.ds.prepare_target_cache('stage2')
+        self.assertEqual(set(self.ds._target_cache), {('png', f.image_path) for f in self.ds.train})
+        self.assertEqual(self.ds.cache_bytes, 0)
+        for frame in self.ds.test:
+            self.ds.target_cpu(frame)
+        self.assertEqual(len(self.ds._target_cache), len(self.ds.train))
+        self.assertEqual(random.getstate(), python_before)
+        numpy_after = np.random.get_state()
+        self.assertEqual(numpy_after[0], numpy_before[0])
+        np.testing.assert_array_equal(numpy_after[1], numpy_before[1])
+        self.assertEqual(numpy_after[2:], numpy_before[2:])
+        self.assertTrue(torch.equal(torch.get_rng_state(), torch_before))
+        for invalid in ('test', 'train', '', None):
+            with self.assertRaises(ValueError):
+                self.ds.prepare_target_cache(invalid)
+        self.ds.clear_target_cache()
+        self.assertIsNone(self.ds._target_cache_stage)
+        self.assertEqual(self.ds.target_cache_bytes, 0)
 
 
 def audit_dataset(path):
